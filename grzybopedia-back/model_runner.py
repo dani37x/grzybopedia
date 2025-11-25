@@ -11,7 +11,7 @@ import os
 print("--- Ładowanie modelu: grzybopedia_saved_model.h5 ---")
 BASE_DIR = os.path.dirname(os.path.abspath(
     __file__))  # folder of model_runner.py
-model_path = os.path.join(BASE_DIR, 'grzybopedia_saved_model.h5')
+model_path = os.path.join(BASE_DIR, 'mushrooms_mobilenet_v2.h5')
 model = load_model(model_path)
 print("--- Model załadowany pomyślnie ---")
 
