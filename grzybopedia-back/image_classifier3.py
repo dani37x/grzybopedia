@@ -10,6 +10,7 @@ from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 import matplotlib.pyplot as plt
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, classification_report
+from sklearn.utils.class_weight import compute_class_weight
 from PIL import Image
 import numpy as np
 
@@ -17,23 +18,22 @@ import numpy as np
 IMAGE_SIZE = (224, 224)
 BATCH_SIZE = 32
 DATA_DIR = r"C:\projects\scripts\Mushrooms"
-EPOCHS = 20
-FINE_TUNE_AT = 100
 SEED = 42
 
-# Ustaw seed dla reprodukowalności
 tf.random.set_seed(SEED)
 np.random.seed(SEED)
 random.seed(SEED)
 
-# ===== Data Augmentation (zastosowana PRZED preprocessingiem) =====
+# ===== SILNIEJSZA augmentacja =====
 data_augmentation = tf.keras.Sequential([
-    layers.RandomFlip("horizontal"),
-    layers.RandomRotation(0.15),  # Zmniejszone - grzyby mają orientację
-    layers.RandomZoom(0.2),
-    layers.RandomTranslation(0.15, 0.15),
-    layers.RandomContrast(0.2),
-    layers.RandomBrightness(0.2)
+    layers.RandomFlip("horizontal_and_vertical"),  # Również pionowo
+    layers.RandomRotation(0.3),  # Więcej rotacji
+    layers.RandomZoom(0.3),
+    layers.RandomTranslation(0.2, 0.2),
+    layers.RandomContrast(0.3),
+    layers.RandomBrightness(0.3),
+    # Dodatkowe augmentacje
+    layers.GaussianNoise(0.1),
 ], name='data_augmentation')
 
 # ===== Clean dataset =====
@@ -43,12 +43,10 @@ def is_valid_image(file_path):
     try:
         img = Image.open(file_path)
         img.verify()
-        # Ponowne otwarcie po verify()
         img = Image.open(file_path)
         img.load()
         return True
     except Exception as e:
-        print(f"Invalid image: {file_path} - {e}")
         return False
 
 
@@ -61,13 +59,13 @@ def clean_directory(directory):
         for file_name in os.listdir(class_path):
             file_path = os.path.join(class_path, file_name)
             if not is_valid_image(file_path):
-                print(f"Removing corrupted image: {file_path}")
+                print(f"Removing: {file_path}")
                 os.remove(file_path)
                 removed_count += 1
-    print(f"Removed {removed_count} corrupted images")
+    print(f"Usunięto {removed_count} uszkodzonych obrazów\n")
 
 
-print("Cleaning dataset...")
+print("Czyszczenie datasetu...")
 clean_directory(DATA_DIR)
 
 # ===== Load dataset =====
@@ -78,7 +76,7 @@ train_ds = image_dataset_from_directory(
     seed=SEED,
     image_size=IMAGE_SIZE,
     batch_size=BATCH_SIZE,
-    label_mode='int'  # Explicit label mode
+    label_mode='int'
 )
 
 val_ds = image_dataset_from_directory(
@@ -93,91 +91,98 @@ val_ds = image_dataset_from_directory(
 
 class_names = train_ds.class_names
 num_classes = len(class_names)
-print(f"\nKlasy: {class_names}")
-print(f"Liczba klas: {num_classes}")
+print(f"Klasy: {class_names}")
+print(f"Liczba klas: {num_classes}\n")
 
-# Policz przykłady w każdej klasie
-class_counts = {}
-for images, labels in train_ds:
-    for label in labels.numpy():
-        class_counts[label] = class_counts.get(label, 0) + 1
+# ===== OBLICZ CLASS WEIGHTS (kluczowe!) =====
+print("Obliczanie wag klas...")
+all_labels = []
+for _, labels in train_ds:
+    all_labels.extend(labels.numpy())
 
-print("\nRozkład klas w zbiorze treningowym:")
+class_weights_array = compute_class_weight(
+    'balanced',
+    classes=np.unique(all_labels),
+    y=all_labels
+)
+class_weights = dict(enumerate(class_weights_array))
+
+print("\nRozkład klas i wagi:")
+class_counts = {i: all_labels.count(i) for i in range(num_classes)}
 for i, count in sorted(class_counts.items()):
-    print(f"  {class_names[i]}: {count}")
+    print(
+        f"  {class_names[i]}: {count} obrazów (waga: {class_weights[i]:.2f})")
 
-# ===== Preprocessing pipeline (POPRAWNA KOLEJNOŚĆ) =====
+# ===== Preprocessing =====
 AUTOTUNE = tf.data.AUTOTUNE
 
 
 def prepare_dataset(ds, is_training=False):
-    """Poprawna kolejność: augmentacja -> preprocessing -> cache/prefetch"""
     if is_training:
-        # Augmentacja na obrazach 0-255
         ds = ds.map(lambda x, y: (data_augmentation(x, training=True), y),
                     num_parallel_calls=AUTOTUNE)
 
-    # Preprocessing MobileNetV2 (skalowanie do -1, 1)
     ds = ds.map(lambda x, y: (preprocess_input(x), y),
                 num_parallel_calls=AUTOTUNE)
 
-    # Cache i prefetch dla wydajności
-    if is_training:
-        ds = ds.cache().prefetch(AUTOTUNE)
-    else:
-        ds = ds.cache().prefetch(AUTOTUNE)
-
-    return ds
+    return ds.cache().prefetch(AUTOTUNE)
 
 
 train_ds = prepare_dataset(train_ds, is_training=True)
 val_ds = prepare_dataset(val_ds, is_training=False)
 
-# ===== Build model =====
+# ===== Build model z MOCNIEJSZĄ regularyzacją =====
 
 
-def build_model(num_classes, fine_tune=False):
-    """Buduje model z opcją fine-tuningu"""
+def build_model(num_classes, fine_tune=False, dropout_rate=0.5):
 
-    # Base model
     base_model = MobileNetV2(
         input_shape=IMAGE_SIZE + (3,),
         include_top=False,
         weights='imagenet',
-        pooling='avg'  # Użyj wbudowanego poolingu
+        pooling='avg'
     )
 
     base_model.trainable = fine_tune
 
     if fine_tune:
-        # Odmroź tylko ostatnie warstwy
-        for layer in base_model.layers[:FINE_TUNE_AT]:
+        # Odmroź tylko ostatnie 50 warstw (mniej niż wcześniej)
+        for layer in base_model.layers[:-50]:
             layer.trainable = False
         print(
-            f"Fine-tuning: {len([l for l in base_model.layers if l.trainable])} warstw odmrożonych")
+            f"Fine-tuning: {len([l for l in base_model.layers if l.trainable])} warstw\n")
 
-    # Classification head
+    # SILNIEJSZA regularyzacja w głowie
     inputs = tf.keras.Input(shape=IMAGE_SIZE + (3,))
-    # Zawsze False dla BN podczas inferencji
     x = base_model(inputs, training=False)
-    x = layers.Dropout(0.3)(x)
-    x = layers.Dense(256, activation='relu',
-                     kernel_regularizer=tf.keras.regularizers.l2(0.01))(x)
-    x = layers.Dropout(0.3)(x)
-    outputs = layers.Dense(num_classes, activation='softmax')(x)
+
+    # Więcej dropoutu i regularyzacji L2
+    x = layers.Dropout(dropout_rate)(x)
+    x = layers.Dense(
+        128,  # Mniejsza warstwa (było 256)
+        activation='relu',
+        kernel_regularizer=tf.keras.regularizers.l2(0.02)  # Silniejsza L2
+    )(x)
+    x = layers.Dropout(dropout_rate)(x)
+
+    outputs = layers.Dense(
+        num_classes,
+        activation='softmax',
+        kernel_regularizer=tf.keras.regularizers.l2(0.01)
+    )(x)
 
     model = tf.keras.Model(inputs, outputs)
     return model
 
 
-# ===== Phase 1: Train classification head =====
-print("\n" + "="*60)
-print("PHASE 1: Training classification head")
-print("="*60)
+# ===== FAZA 1: Trening głowy (z class weights!) =====
+print("="*70)
+print("FAZA 1: Trening classification head z class weights")
+print("="*70 + "\n")
 
-model = build_model(num_classes, fine_tune=False)
+model = build_model(num_classes, fine_tune=False, dropout_rate=0.6)
 model.compile(
-    optimizer=Adam(learning_rate=1e-3),
+    optimizer=Adam(learning_rate=5e-4),  # Mniejszy LR
     loss='sparse_categorical_crossentropy',
     metrics=['accuracy']
 )
@@ -185,15 +190,16 @@ model.compile(
 callbacks_phase1 = [
     EarlyStopping(
         monitor='val_loss',
-        patience=5,
+        patience=8,
         restore_best_weights=True,
-        verbose=1
+        verbose=1,
+        mode='min'
     ),
     ReduceLROnPlateau(
         monitor='val_loss',
-        factor=0.5,
-        patience=3,
-        min_lr=1e-6,
+        factor=0.3,  # Bardziej agresywna redukcja
+        patience=4,
+        min_lr=1e-7,
         verbose=1
     )
 ]
@@ -201,25 +207,30 @@ callbacks_phase1 = [
 history1 = model.fit(
     train_ds,
     validation_data=val_ds,
-    epochs=15,  # Więcej epok - early stopping zatrzyma gdy potrzeba
+    epochs=30,
     callbacks=callbacks_phase1,
+    class_weight=class_weights,  # KLUCZOWE!
     verbose=1
 )
 
-# ===== Phase 2: Fine-tuning =====
-print("\n" + "="*60)
-print("PHASE 2: Fine-tuning")
-print("="*60)
+# ===== FAZA 2: Fine-tuning =====
+print("\n" + "="*70)
+print("FAZA 2: Fine-tuning (mniej warstw, mniejszy dropout)")
+print("="*70 + "\n")
 
-# Przebuduj model z odmrożonymi warstwami
-model = build_model(num_classes, fine_tune=True)
+# Przebuduj z fine-tuningiem i mniejszym dropoutem
+model_ft = build_model(num_classes, fine_tune=True, dropout_rate=0.4)
 
-# Załaduj wagi z fazy 1
-temp_model = build_model(num_classes, fine_tune=False)
-temp_model.set_weights(model.get_weights())
+# Kopiuj wagi z fazy 1
+for i, layer in enumerate(model_ft.layers):
+    if i < len(model.layers):
+        try:
+            layer.set_weights(model.layers[i].get_weights())
+        except:
+            pass
 
-model.compile(
-    optimizer=Adam(learning_rate=1e-5),
+model_ft.compile(
+    optimizer=Adam(learning_rate=1e-5),  # Bardzo mały LR
     loss='sparse_categorical_crossentropy',
     metrics=['accuracy']
 )
@@ -227,43 +238,44 @@ model.compile(
 callbacks_phase2 = [
     EarlyStopping(
         monitor='val_loss',
-        patience=10,
+        patience=12,
         restore_best_weights=True,
-        verbose=1
+        verbose=1,
+        mode='min'
     ),
     ReduceLROnPlateau(
         monitor='val_loss',
         factor=0.5,
-        patience=5,
-        min_lr=1e-7,
+        patience=6,
+        min_lr=1e-8,
         verbose=1
     )
 ]
 
-history2 = model.fit(
+history2 = model_ft.fit(
     train_ds,
     validation_data=val_ds,
-    epochs=50,  # Więcej epok - early stopping zatrzyma gdy potrzeba
+    epochs=50,
     callbacks=callbacks_phase2,
+    class_weight=class_weights,  # KLUCZOWE!
     verbose=1
 )
 
-# ===== Save model =====
-model_name = "mushrooms_mobilenet_v2.h5"
-model.save(model_name)
-print(f"\n✔ Model zapisany jako {model_name}")
+model = model_ft  # Użyj fine-tuned model
 
-# Zapisz również class_names
+# ===== Save =====
+model.save("mushrooms_mobilenet_v2.h5")
+print("\n✔ Model zapisany: mushrooms_mobilenet_v2.h5")
+
 with open('class_names.json', 'w') as f:
     json.dump(class_names, f)
-print("✔ Nazwy klas zapisane jako class_names.json")
+print("✔ Klasy zapisane: class_names.json\n")
 
 # ===== Evaluation =====
-print("\n" + "="*60)
-print("EVALUATION")
-print("="*60)
+print("="*70)
+print("EWALUACJA")
+print("="*70 + "\n")
 
-# Zbierz wszystkie dane walidacyjne
 val_images_list = []
 val_labels_list = []
 for batch_images, batch_labels in val_ds:
@@ -273,17 +285,25 @@ for batch_images, batch_labels in val_ds:
 val_images = tf.concat(val_images_list, axis=0)
 val_labels = tf.concat(val_labels_list, axis=0)
 
-# Predykcje
 predictions = model.predict(val_images, verbose=0)
 predicted_classes = tf.argmax(predictions, axis=1).numpy()
 true_classes = val_labels.numpy()
 
-# Classification report
-print("\nClassification Report:")
+print("Classification Report:")
 print(classification_report(true_classes, predicted_classes,
                             target_names=class_names, digits=3))
 
-# ===== Plots =====
+# Analiza pewności predykcji
+confidences = np.max(predictions, axis=1)
+print(f"\nStatystyki pewności predykcji:")
+print(f"  Średnia: {np.mean(confidences):.3f}")
+print(f"  Mediana: {np.median(confidences):.3f}")
+print(f"  Min: {np.min(confidences):.3f}")
+print(f"  Max: {np.max(confidences):.3f}")
+print(
+    f"  % predykcji > 70%: {(confidences > 0.7).sum() / len(confidences) * 100:.1f}%")
+
+# ===== Wykresy =====
 # 1. Training history
 acc = history1.history['accuracy'] + history2.history['accuracy']
 val_acc = history1.history['val_accuracy'] + history2.history['val_accuracy']
@@ -291,44 +311,68 @@ loss = history1.history['loss'] + history2.history['loss']
 val_loss = history1.history['val_loss'] + history2.history['val_loss']
 epochs_range = range(len(acc))
 
-plt.figure(figsize=(14, 5))
-plt.subplot(1, 2, 1)
+plt.figure(figsize=(16, 5))
+
+plt.subplot(1, 3, 1)
 plt.plot(epochs_range, acc, label='Train Accuracy', linewidth=2)
 plt.plot(epochs_range, val_acc, label='Val Accuracy', linewidth=2)
 plt.axvline(x=len(history1.history['accuracy']), color='r',
-            linestyle='--', label='Fine-tuning starts')
+            linestyle='--', alpha=0.7, label='Fine-tuning starts')
 plt.legend()
 plt.title('Accuracy')
 plt.xlabel('Epoch')
 plt.ylabel('Accuracy')
 plt.grid(True, alpha=0.3)
 
-plt.subplot(1, 2, 2)
+plt.subplot(1, 3, 2)
 plt.plot(epochs_range, loss, label='Train Loss', linewidth=2)
 plt.plot(epochs_range, val_loss, label='Val Loss', linewidth=2)
 plt.axvline(x=len(history1.history['loss']), color='r',
-            linestyle='--', label='Fine-tuning starts')
+            linestyle='--', alpha=0.7, label='Fine-tuning starts')
 plt.legend()
 plt.title('Loss')
 plt.xlabel('Epoch')
 plt.ylabel('Loss')
 plt.grid(True, alpha=0.3)
+
+plt.subplot(1, 3, 3)
+plt.hist(confidences, bins=30, edgecolor='black', alpha=0.7)
+plt.axvline(x=0.7, color='r', linestyle='--', label='70% threshold')
+plt.xlabel('Confidence')
+plt.ylabel('Count')
+plt.title('Prediction Confidence Distribution')
+plt.legend()
+plt.grid(True, alpha=0.3)
+
 plt.tight_layout()
-plt.savefig('training_history.png', dpi=150)
+plt.savefig('training_history.png', dpi=150, bbox_inches='tight')
 plt.show()
 
 # 2. Confusion Matrix
 cm = confusion_matrix(true_classes, predicted_classes)
-disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_names)
-plt.figure(figsize=(12, 10))
-disp.plot(cmap=plt.cm.Blues, xticks_rotation=45)
-plt.title("Confusion Matrix", fontsize=14)
+
+# Normalizowana macierz (%)
+cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 8))
+
+# Zwykła macierz
+disp1 = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_names)
+disp1.plot(cmap=plt.cm.Blues, xticks_rotation=45, ax=ax1)
+ax1.set_title("Confusion Matrix (Counts)", fontsize=14)
+
+# Znormalizowana
+disp2 = ConfusionMatrixDisplay(
+    confusion_matrix=cm_normalized, display_labels=class_names)
+disp2.plot(cmap=plt.cm.Blues, xticks_rotation=45, ax=ax2, values_format='.2f')
+ax2.set_title("Confusion Matrix (Normalized)", fontsize=14)
+
 plt.tight_layout()
-plt.savefig('confusion_matrix.png', dpi=150)
+plt.savefig('confusion_matrix.png', dpi=150, bbox_inches='tight')
 plt.show()
 
-# 3. Sample predictions
-print("\nGenerowanie przykładowych predykcji...")
+# 3. Sample predictions z rozkładem prawdopodobieństwa
+print("\nGenerowanie przykładowych predykcji...\n")
 raw_val_ds = image_dataset_from_directory(
     DATA_DIR,
     validation_split=0.2,
@@ -336,25 +380,25 @@ raw_val_ds = image_dataset_from_directory(
     seed=SEED,
     image_size=IMAGE_SIZE,
     batch_size=1,
-    shuffle=False
+    shuffle=True
 )
 
-# Weź losowe próbki
-all_samples = list(raw_val_ds.unbatch().take(100))
+all_samples = list(raw_val_ds.unbatch().take(200))
 random_samples = random.sample(all_samples, min(9, len(all_samples)))
 
-plt.figure(figsize=(12, 12))
+fig = plt.figure(figsize=(15, 12))
 for i, (img, label) in enumerate(random_samples):
-    # Preprocessing
     img_array = tf.expand_dims(img, axis=0)
     img_processed = preprocess_input(img_array)
 
-    # Predykcja
-    prediction = model.predict(img_processed, verbose=0)
+    prediction = model.predict(img_processed, verbose=0)[0]
     predicted_idx = np.argmax(prediction)
-    confidence = prediction[0][predicted_idx] * 100
+    confidence = prediction[predicted_idx] * 100
 
-    # Wyświetl
+    # Top 3 predykcje
+    top3_idx = prediction.argsort()[-3:][::-1]
+
+    # Subplot dla obrazu
     ax = plt.subplot(3, 3, i + 1)
     plt.imshow(img.numpy().astype("uint8"))
 
@@ -362,15 +406,25 @@ for i, (img, label) in enumerate(random_samples):
     pred_label = class_names[predicted_idx]
     color = 'green' if true_label == pred_label else 'red'
 
-    plt.title(f"True: {true_label}\nPred: {pred_label}\nConf: {confidence:.1f}%",
-              color=color, fontsize=9)
+    # Tytuł z top 3
+    title = f"True: {true_label}\n"
+    title += f"Pred: {pred_label} ({confidence:.1f}%)\n"
+    title += f"Top3: "
+    for idx in top3_idx[:3]:
+        title += f"{class_names[idx][:4]} {prediction[idx]*100:.0f}% "
+
+    plt.title(title, color=color, fontsize=8)
     plt.axis("off")
 
 plt.tight_layout()
-plt.savefig('sample_predictions.png', dpi=150)
+plt.savefig('sample_predictions.png', dpi=150, bbox_inches='tight')
 plt.show()
 
-print("\n✔ Training complete!")
-print(f"✔ Model: {model_name}")
-print(f"✔ Classes: class_names.json")
-print(f"✔ Plots: training_history.png, confusion_matrix.png, sample_predictions.png")
+print("\n" + "="*70)
+print("✔ Training zakończony!")
+print("="*70)
+print(f"Pliki:")
+print(f"  - Model: mushrooms_mobilenet_v2.h5")
+print(f"  - Klasy: class_names.json")
+print(f"  - Wykresy: training_history.png, confusion_matrix.png, sample_predictions.png")
+print("="*70)
